@@ -16,3 +16,4 @@ class User(Base):
     flags_json: Mapped[object | None] = mapped_column(JSON, nullable=True)
 
 
+

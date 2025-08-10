@@ -1,0 +1,348 @@
+*** Add File: server/game/types.py
++from __future__ import annotations
++from typing import Any, Literal, TypedDict
++import time
++
++Op = Literal["hello", "ping", "move", "chat", "state", "event", "warn", "resync"]
++
++class Msg(TypedDict, total=False):
++    v: int
++    op: Op
++    seq: int
++    ack: int
++    ts: int
++    payload: Any
++
++def now_ms() -> int:
++    return int(time.time() * 1000)
++
++ALLOWED_OPS: set[str] = {"hello","ping","move","chat","state","event","warn","resync"}
++
++def build_msg(op: Op, payload: Any | None = None, seq: int | None = None, ack: int | None = None) -> Msg:
++    msg: Msg = {"v": 1, "op": op, "ts": now_ms()}
++    if seq is not None:
++        msg["seq"] = int(seq)
++    if ack is not None:
++        msg["ack"] = int(ack)
++    if payload is not None:
++        msg["payload"] = payload
++    return msg
++
++def parse_msg(raw: Any) -> Msg | None:
++    if not isinstance(raw, dict):
++        return None
++    v = raw.get("v")
++    op = raw.get("op")
++    if v != 1 or not isinstance(op, str) or op not in ALLOWED_OPS:
++        return None
++    for k in ("seq", "ack", "ts"):
++        if k in raw and not isinstance(raw[k], int):
++            return None
++    return raw  # type: ignore[return-value]
+
+*** Update File: server/game/loop.py
+@@
+-from typing import Optional, Dict
+-from collections import deque
+-from .aoi import GridAoI, Entity
+-from .types import build_msg
++from typing import Optional, Dict, Deque
++from collections import deque
++from .aoi import GridAoI, Entity
++from .types import build_msg
++from .state import Player, WorldState
+@@
+-        self.aoi = GridAoI(cell_size=16)
+-        self.entities: Dict[str, Entity] = {}
+-        self.state_seq: int = 0
+-        # inputs por player: fila ordenada por seq e último seq aplicado
+-        self.player_inputs: Dict[str, Deque[dict]] = {}
+-        self.last_input_seq_applied: Dict[str, int] = {}
++        self.aoi = GridAoI(cell_size=16)
++        self.entities: Dict[str, Entity] = {}
++        self.state_seq: int = 0
++        self.player_inputs: Dict[str, Deque[dict]] = {}
++        self.last_input_seq_applied: Dict[str, int] = {}
++        self.world = WorldState()
++        self.sent_version_by_player: Dict[str, Dict[str, int]] = {}
+@@
+     async def _tick(self, dt: float) -> None:
+-        # No MVP, apenas mantém o loop ativo
+-        _ = dt
++        self.state_seq += 1
++        _ = dt
+@@
+-    def apply_inputs_and_build_state(self, player_id: str, you: Entity) -> dict:
++    def apply_inputs_and_build_state(self, player_id: str, you: Entity) -> dict:
+         q = self.player_inputs.setdefault(player_id, deque())
+         last_applied = self.last_input_seq_applied.get(player_id, 0)
+         while q:
+             m = q[0]
+             seq = int(m.get("seq", 0))
+             if seq <= last_applied:
+                 q.popleft()
+                 continue
+             # ordem crescente: aplica o próximo
+             q.popleft()
+-            dx = int(m.get("payload", {}).get("dx", 0))
+-            dy = int(m.get("payload", {}).get("dy", 0))
+-            # clamp velocidade/passo
+-            if dx < -1 or dx > 1 or dy < -1 or dy > 1:
+-                # invalida salto impossível
+-                continue
++            dx = int(m.get("payload", {}).get("dx", 0))
++            dy = int(m.get("payload", {}).get("dy", 0))
++            # clamp passo/velocidade (±1 por input; expandir conforme tick-rate)
++            if dx < -1 or dx > 1 or dy < -1 or dy > 1:
++                continue
+             you.x += dx
+             you.y += dy
+             last_applied = seq
+         self.last_input_seq_applied[player_id] = last_applied
+-        # snapshot mínimo com seq global e ack do último input aplicado
+-        return build_msg(
+-            op="state",
+-            seq=self.state_seq,
+-            ack=last_applied,
+-            payload={
+-                "you": {"x": you.x, "y": you.y, "hp": 100, "mp": 50},
+-                "entities": [],
+-            },
+-        )
++        # payload (pode ser mínimo; suporta diffs quando disponível)
++        sent_version = self.sent_version_by_player.setdefault(player_id, {})
++        payload = self.world.build_diffs(
++            you=Player(id=you.id, x=you.x, y=you.y, hp=100, mp=50),
++            visible_ids=list(self.aoi.neighbors(you.x, you.y, radius_chunks=1)),
++            sent_version=sent_version,
++        )
++        return build_msg(op="state", seq=self.state_seq, ack=last_applied, payload=payload)
+
+*** Update File: server/ws/endpoints.py
+@@
+-from services.redis import redis_manager, pop_ws_ticket
+-from game.state import Player, build_state
+-from game.loop import GameServer
++from services.redis import redis_manager, pop_ws_ticket
++from game.state import Player
++from game.loop import GameServer
++from game.types import parse_msg, build_msg, now_ms
+ from app.config import get_settings
+ from utils.security import is_origin_allowed, extract_subprotocols
+-from utils.ratelimit import allow
++from utils.ratelimit import allow, allow_per_second
+@@
+-    await websocket.accept(subprotocol="zerion.v1")
++    await websocket.accept(subprotocol="zerion.v1")
+     active_sockets.add(websocket)
+@@
+-    seq = 0
+     you = Player(id=user_id, x=0, y=0)
+-    last_client_seq = 0
++    last_client_seq = 0
++    move_rate_key = f"rl:move:{user_id}"
+@@
+-            raw = await websocket.receive_bytes()
+-            incoming: dict[str, Any] = umsgpack.unpackb(raw)
+-            t = incoming.get("t")
+-            if t == "ping":
+-                out = umsgpack.packb({"t": "pong", "ts": int(time.time() * 1000)})
+-                await websocket.send_bytes(out)
+-            elif t == "chat":
++            raw = await websocket.receive_bytes()
++            decoded = umsgpack.unpackb(raw)
++            msg = parse_msg(decoded)
++            if not msg:
++                continue
++            op = msg.get("op")
++            seq = int(msg.get("seq", 0))
++            if seq and seq <= last_client_seq:
++                continue
++            if seq:
++                last_client_seq = seq
++            if op == "ping":
++                out = build_msg("ping")
++                await websocket.send_bytes(umsgpack.packb(out))
++            elif op == "chat":
+                 channel = incoming.get("channel", "global")
+                 msg = str(incoming.get("msg", ""))[:200]
+@@
+-            elif t == "move":
+-                # placeholder: aceitar mensagens de movimento para futura reconciliação
+-                dx = int(incoming.get("dx", 0))
+-                dy = int(incoming.get("dy", 0))
+-                you.x += dx
+-                you.y += dy
+-                seq += 1
+-                # envia snapshot mínimo
+-                snapshot = build_state(seq, you, {})
+-                await websocket.send_bytes(umsgpack.packb(snapshot))
++            elif op == "move":
++                if not await allow_per_second(move_rate_key, 20):
++                    warn = build_msg("warn", {"code": "rate_move"})
++                    await websocket.send_bytes(umsgpack.packb(warn))
++                    continue
++                server.enqueue_move(user_id, msg)
++                snap = server.apply_inputs_and_build_state(user_id, you)
++                await websocket.send_bytes(umsgpack.packb(snap))
+@@
+-    # Redis pub/sub para chat global
++    # hello inicial com tick_hz/tempo do servidor
++    hello = build_msg("hello", {"tick_hz": 10, "server_time_ms": now_ms()})
++    await websocket.send_bytes(umsgpack.packb(hello))
++    # Redis pub/sub para chat global
+
+*** Update File: client/src/game/net/protocol.ts
+@@
+-export type ClientMove = { t: "move"; dx: number; dy: number; seq: number };
+-export type ClientChat = { t: "chat"; channel: string; msg: string };
+-export type ClientPing = { t: "ping"; ts?: number };
+-
+-export type ClientMessage = ClientMove | ClientChat | ClientPing;
+-
+-export type ServerPong = { t: "pong"; ts: number };
+-export type ServerEventMsg = {
+-  t: "event";
+-  type: "msg" | "warn";
+-  payload: {
+-    channel?: string;
+-    from?: string;
+-    msg?: string;
+-    ts?: number;
+-    code?: string;
+-  };
+-};
+-export type ServerState = {
+-  t: "state";
+-  seq: number;
+-  you: { x: number; y: number; hp: number; mp: number };
+-  entities: Array<{ id: string; x: number; y: number; kind: string }>;
+-};
+-
+-export type ServerMessage = ServerPong | ServerEventMsg | ServerState;
++export type Op = 'hello'|'ping'|'move'|'chat'|'state'|'event'|'warn'|'resync'
++export type Msg<T=unknown> = { v:1; op:Op; seq?:number; ack?:number; ts:number; payload?:T }
++export type HelloPayload = { tick_hz:number; server_time_ms:number }
++export type MovePayload = { dx:number; dy:number }
++export type ChatPayload = { channel:string; msg:string }
++export type EventPayload = { channel?:string; from?:string; msg?:string; ts?:number; code?:string }
++export type StatePayload = {
++  you:{ x:number; y:number; hp:number; mp:number };
++  entities:Array<{ id:string; x:number; y:number; kind:string }>;
++  // opcional (AoI diffs quando presentes no servidor)
++  added?: Array<{ id:string; kind:string; x:number; y:number; hp:number; meta?:Record<string,unknown> }>;
++  updated?: Array<{ id:string; patch: Partial<{ x:number; y:number; hp:number; meta:Record<string,unknown> }> }>;
++  removed?: string[];
++}
+
+*** Update File: client/src/game/net/socket.ts
+@@
+-import type { Msg, MovePayload, StatePayload, EventPayload } from "./protocol";
++import type { Msg, MovePayload, StatePayload, EventPayload } from "./protocol";
+ import { gameEvents } from "@/game/events";
++import { ClientWorldState } from "@/game/state";
+@@
+-export class ZerionSocket {
++export class ZerionSocket {
+   private ws: WebSocket | null = null;
+-  private backoffMs = 1000;
++  private backoffMs = 1000;
+   private maxBackoffMs = 15000;
+   private shouldReconnect = false;
+   private token: string | null = null;
++  private seqCounter = 0;
++  private pendingInputs = new Map<number, { dx: number; dy: number; ts: number }>();
++  private lastAck = 0;
++  private world = new ClientWorldState();
+@@
+-      this.ws.onmessage = (ev: MessageEvent<ArrayBuffer | string>) => {
+-        try {
+-          const buf =
+-            typeof ev.data === "string"
+-              ? new TextEncoder().encode(ev.data)
+-              : new Uint8Array(ev.data as ArrayBuffer);
+-          const msg = decode(buf) as ServerMessage;
+-          this.listeners.forEach((l) => l(msg));
+-          if ((msg as any).t === "state")
+-            gameEvents.emitServerState(msg as any);
+-        } catch (e) {
+-          // ignore malformed
+-        }
+-      };
++      this.ws.onmessage = (ev: MessageEvent<ArrayBuffer | string>) => this.onMessage(ev);
+@@
+-  send(message: ClientMessage) {
+-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+-    const payload = encode(message);
+-    this.ws.send(payload);
+-  }
++  private onMessage(ev: MessageEvent<ArrayBuffer | string>) {
++    try {
++      const buf = typeof ev.data === "string" ? new TextEncoder().encode(ev.data) : new Uint8Array(ev.data as ArrayBuffer);
++      const msg = decode(buf) as Msg<any>;
++      if (msg.op === "state") {
++        if (msg.ack && msg.ack > this.lastAck) this.lastAck = msg.ack;
++        for (const k of Array.from(this.pendingInputs.keys())) if (k <= (msg.ack ?? 0)) this.pendingInputs.delete(k);
++        const state = msg.payload as StatePayload;
++        let x = state.you.x, y = state.you.y;
++        if ((state as any).added)  this.world.applyAdded((state as any).added);
++        if ((state as any).updated) this.world.applyUpdated((state as any).updated);
++        if ((state as any).removed) this.world.applyRemoved((state as any).removed);
++        for (const [, input] of Array.from(this.pendingInputs.entries()).sort((a, b) => a[0] - b[0])) { x += input.dx; y += input.dy; }
++        gameEvents.emitServerState({ you: { ...state.you, x, y }, entities: state.entities } as any);
++        return;
++      }
++      if (msg.op === "event") {
++        const e = msg.payload as EventPayload;
++        if (e && (e as any).channel) gameEvents.emitChat({ channel: e.channel!, from: e.from!, msg: e.msg!, ts: e.ts! });
++        return;
++      }
++      if (msg.op === "warn") {
++        // TODO: repassar à UI
++        return;
++      }
++    } catch { /* ignore */ }
++  }
++
++  sendMove(dx: number, dy: number) {
++    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
++    const seq = ++this.seqCounter, ts = Date.now();
++    this.pendingInputs.set(seq, { dx, dy, ts });
++    const msg: Msg<MovePayload> = { v: 1, op: "move", seq, ts, payload: { dx, dy } };
++    this.ws.send(encode(msg));
++  }
+
+*** Update File: client/src/store/useGameStore.ts
+@@
+-    ping: () => {
+-      socket.send({ t: "ping", ts: Date.now() });
+-    },
++    ping: () => { socket.sendPing?.(); },
+@@
+-    sendChat: () => {
+-      const text = get().chatInput.trim();
+-      if (!text) return;
+-      socket.send({ t: "chat", channel: "global", msg: text } as any);
+-      set({ chatInput: "" });
+-    },
++    sendChat: () => {
++      const text = get().chatInput.trim();
++      if (!text) return;
++      socket.sendChat?.("global", text);
++      set({ chatInput: "" });
++    },
+
+Decisões e notas
+Envelope padronizado v1: todas as mensagens seguem { v:1, op, seq?, ack?, ts, payload? }.
+Servidor:
+Ordena/aplica inputs por cliente (seq crescente), clampa passos e envia state com seq/ack.
+Rate-limit de move: 20/s por usuário (janela 1s) → envia warn{code:'rate_move'} ao exceder.
+Envia hello ao conectar com tick_hz/server_time.
+Cliente:
+Mantém seqCounter e pendingInputs; ao receber state, remove <= ack e reaplica restantes (reconciliação).
+Integra diffs de AoI quando presentes (compatível com payload mínimo).
+Handshake/ticket/origin inalterados; msgpack binário preservado; 1 worker no Uvicorn.
+Como validar rapidamente
+Conectar e ver hello.
+Segurar setas: movimento fluido sem “pull-back”.
+Flood >20 move/s no console do browser: recebe warn{code:'rate_move'}; excesso descartado.

@@ -1,5 +1,8 @@
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# URL padrão do banco (usada quando nenhuma variável de ambiente é fornecida)
+DEFAULT_DATABASE_URL = "mysql+asyncmy://root:root@mysql:3306/zerion_db"
 
 
 class Settings(BaseModel):
@@ -19,12 +22,33 @@ class Settings(BaseModel):
     ticket_ttl_seconds: int = int(os.getenv("TICKET_TTL_SECONDS", "60"))
     rate_login_max: int = int(os.getenv("RATE_LOGIN_MAX", "10"))
     rate_chat_max: int = int(os.getenv("RATE_CHAT_MAX", "20"))
-    database_url: str = os.getenv("DATABASE_URL", "mysql+asyncmy://root:root@mysql:3306/zerion_db")
+    database_url: str = Field(default_factory=lambda: os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL))
     db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "10"))
     db_max_overflow: int = int(os.getenv("DB_MAX_OVERFLOW", "10"))
     db_pool_timeout: int = int(os.getenv("DB_POOL_TIMEOUT", "30"))
     db_pool_recycle: int = int(os.getenv("DB_POOL_RECYCLE", "1800"))
     dev_login_fallback: bool = os.getenv("DEV_LOGIN_FALLBACK", "false").lower() == "true"
+
+
+def _apply_driver_fallback() -> None:
+    """
+    Fallback: em Windows, se a URL usa asyncmy e o driver não estiver disponível,
+    trocamos para o driver assíncrono "aiomysql" para manter compatibilidade com create_async_engine.
+    Também cobre o caso onde a variável de ambiente não está definida (usa DEFAULT_DATABASE_URL).
+    """
+    try:
+        import asyncmy  # type: ignore  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        url = os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
+        if url.startswith("mysql+asyncmy://"):
+            os.environ["DATABASE_URL"] = url.replace("mysql+asyncmy://", "mysql+aiomysql://", 1)
+
+
+_apply_driver_fallback()
 
 
 def get_settings() -> Settings:

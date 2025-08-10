@@ -7,6 +7,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
+import os
+from game.map_loader import load_tiled_json
+from game import map_loader as map_module
 from routes.health import router as health_router
 from routes.auth import router as auth_router
 from ws.endpoints import router as ws_router
@@ -23,6 +26,13 @@ game_server = GameServer(tick_hz=10)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    # Carrega mapa Tiled
+    try:
+        base = os.path.dirname(__file__)
+        map_path = os.path.normpath(os.path.join(base, "../assets/maps/zerion_start.json"))
+        map_module.MAP = load_tiled_json(map_path, "zerion_start")
+    except Exception:
+        map_module.MAP = None
     game_server.start()
     await persistence_manager.start()
     # Inicializa Redis cedo

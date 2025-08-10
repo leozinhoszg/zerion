@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import text
 
 from app.config import get_settings
 
@@ -32,7 +33,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def test_db() -> bool:
     try:
         async with AsyncSessionLocal() as s:
-            await s.execute("SELECT 1")
+            await s.execute(text("SELECT 1"))
         return True
     except Exception:
         return False

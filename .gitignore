@@ -1,0 +1,35 @@
+# Node
+client/node_modules/
+client/.next/
+client/.turbo/
+client/.vercel/
+client/.swc/
+
+# Python
+server/.venv/
+server/__pycache__/
+server/*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+
+# Docker
+**/dist/
+**/build/
+
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+
+# Windows stray file
+server/NUL
+
+
+
+
+

@@ -25,3 +25,4 @@ class Character(Base):
     updated_at: Mapped[object] = mapped_column(TIMESTAMP, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
 
 
+

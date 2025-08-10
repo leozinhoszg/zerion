@@ -8,7 +8,8 @@ prometheus-client==0.20.0
 websockets==12.0
 u-msgpack-python==2.8.0
 SQLAlchemy>=2.0
-asyncmy>=0.2
+asyncmy>=0.2 ; sys_platform != 'win32'
+aiomysql>=0.2
 alembic>=1.13
 passlib[bcrypt]==1.7.4
 

@@ -12,7 +12,8 @@ from services.repositories.character_repository import get_by_user, create_defau
 from services.persistence import persistence_manager
 from game.state import Player
 from game.loop import GameServer
-from game.types import parse_msg, build_msg
+from game.types import parse_msg, build_msg, now_ms
+from game import map_loader as map_module
 from app.config import get_settings
 from utils.security import is_origin_allowed, extract_subprotocols
 from utils.ratelimit import allow, allow_per_second
@@ -84,7 +85,10 @@ async def ws_endpoint(websocket: WebSocket):
     server = GameServer(tick_hz=settings and getattr(settings, 'tick_hz', 10) or 10)
 
     # hello inicial
-    hello = build_msg("hello", {"tick_hz": server.tick_hz, "server_time_ms": int(time.time() * 1000)})
+    map_info = None
+    if map_module.MAP:
+        map_info = {"id": map_module.MAP.id, "version": map_module.MAP.version, "tile_w": map_module.MAP.tile_w, "tile_h": map_module.MAP.tile_h}
+    hello = build_msg("hello", {"tick_hz": server.tick_hz, "server_time_ms": now_ms(), "map": map_info})
     await websocket.send_bytes(umsgpack.packb(hello))
 
     try:

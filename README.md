@@ -29,13 +29,6 @@ Principais chaves:
 - `REDIS_URL`
 - `DATABASE_URL` (ex.: `mysql+asyncmy://root:root@mysql:3306/zerion_db`)
 
-Exemplos de `DATABASE_URL`:
-
-```
-DATABASE_URL=mysql+asyncmy://root:root@mysql:3306/zerion_db
-# Local com senha contendo '@' → encode '%40':
-# DATABASE_URL=mysql+asyncmy://root:Jae66yrr%40@127.0.0.1:3306/zerion_db
-```
 
 ### Rodando com Docker Compose
 
